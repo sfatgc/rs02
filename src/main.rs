@@ -1,5 +1,10 @@
-use std::io;
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    fs,
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -7,6 +12,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use directories::ProjectDirs;
+use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -15,25 +22,37 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
-use midir::{MidiInput, MidiOutput};
+use serde::{Deserialize, Serialize};
+use std::sync::mpsc::{self, Receiver, Sender};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Focus {
     Left,
     Right,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum MidiKind {
     Input,
     Output,
 }
 
-#[derive(Clone, Debug)]
-struct DeviceItem {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DeviceKey {
     name: String,
     kind: MidiKind,
-    index: usize, // index within its kind (as provided by midir)
+}
+
+#[derive(Clone, Debug)]
+struct DeviceItem {
+    key: DeviceKey,
+    index: usize, // index within its kind (as provided by midir at collection time)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Persisted {
+    last_device: Option<DeviceKey>,
+    last_focus: Option<Focus>,
 }
 
 struct App {
@@ -41,26 +60,58 @@ struct App {
     selected: usize,
     focus: Focus,
     last_refresh: Instant,
+
+    // Persistence
+    persist_path: Option<PathBuf>,
+
+    // Open connection (only one at a time for simplicity)
+    open_device: Option<DeviceKey>,
+    in_conn: Option<MidiInputConnection<()>>,
+    out_conn: Option<MidiOutputConnection>,
+
+    // Live log (for input devices)
+    log: VecDeque<String>,
+    tx: Sender<String>,
+    rx: Receiver<String>,
 }
 
 impl App {
     fn new() -> Result<Self> {
+        let persist_path = persist_file_path();
+        let persisted = load_persisted(&persist_path).unwrap_or_default();
+
         let devices = collect_devices()?;
+        let (tx, rx) = mpsc::channel::<String>();
+
+        // Restore selection by last_device if possible
+        let mut selected = 0usize;
+        if let Some(ref key) = persisted.last_device {
+            if let Some(pos) = devices.iter().position(|d| &d.key == key) {
+                selected = pos;
+            }
+        }
+
         Ok(Self {
             devices,
-            selected: 0,
-            focus: Focus::Left,
+            selected,
+            focus: persisted.last_focus.unwrap_or(Focus::Left),
             last_refresh: Instant::now(),
+            persist_path,
+            open_device: None,
+            in_conn: None,
+            out_conn: None,
+            log: VecDeque::with_capacity(512),
+            tx,
+            rx,
         })
     }
 
     fn refresh_devices(&mut self) {
         if let Ok(devs) = collect_devices() {
-            // Try to keep selection on the same device name if possible
-            let old_name = self.devices.get(self.selected).map(|d| d.name.clone());
+            let old_key = self.devices.get(self.selected).map(|d| d.key.clone());
             self.devices = devs;
-            if let Some(name) = old_name {
-                if let Some(pos) = self.devices.iter().position(|d| d.name == name) {
+            if let Some(key) = old_key {
+                if let Some(pos) = self.devices.iter().position(|d| d.key == key) {
                     self.selected = pos;
                 } else {
                     self.selected = 0;
@@ -73,7 +124,9 @@ impl App {
     }
 
     fn select_up(&mut self) {
-        if self.devices.is_empty() { return; }
+        if self.devices.is_empty() {
+            return;
+        }
         if self.selected == 0 {
             self.selected = self.devices.len() - 1;
         } else {
@@ -82,8 +135,126 @@ impl App {
     }
 
     fn select_down(&mut self) {
-        if self.devices.is_empty() { return; }
+        if self.devices.is_empty() {
+            return;
+        }
         self.selected = (self.selected + 1) % self.devices.len();
+    }
+
+    fn toggle_open_selected(&mut self) -> Result<()> {
+        if self.devices.is_empty() {
+            return Ok(());
+        }
+        let dev = self.devices[self.selected].clone();
+
+        // If same device is already open -> close it
+        if self.open_device.as_ref() == Some(&dev.key) {
+            self.close_open();
+            return Ok(());
+        }
+
+        // Otherwise switch: close current and open the selected
+        self.close_open();
+        match dev.key.kind {
+            MidiKind::Input => self.open_input(&dev),
+            MidiKind::Output => self.open_output(&dev),
+        }
+    }
+
+    fn open_input(&mut self, dev: &DeviceItem) -> Result<()> {
+        let mut inp = MidiInput::new("midir-tui-input").context("create MidiInput failed")?;
+        // Receive everything (no ignore)
+        inp.ignore(midir::Ignore::None);
+
+        // Re-enumerate and pick by index within inputs
+        let ports = inp.ports();
+        let port = ports.get(dev.index).context("input port index out of range")?;
+        let port_name = inp
+            .port_name(port)
+            .unwrap_or_else(|_| format!("Input #{}", dev.index));
+
+        let tx = self.tx.clone();
+        let conn = inp
+            .connect(
+                port,
+                "midir-tui-in",
+                move |_stamp, message, _| {
+                    // Small, cheap formatting
+                    let s = format!(
+                        "IN  {:02X?}  (len {})",
+                        message,
+                        message.len()
+                    );
+                    let _ = tx.send(s);
+                },
+                (),
+            )
+            .with_context(|| format!("Failed to open input: {port_name}"))?;
+
+        self.in_conn = Some(conn);
+        self.open_device = Some(dev.key.clone());
+        self.push_status(format!("Opened input: {}", port_name));
+        Ok(())
+    }
+
+    fn open_output(&mut self, dev: &DeviceItem) -> Result<()> {
+        let out = MidiOutput::new("midir-tui-output").context("create MidiOutput failed")?;
+        let ports = out.ports();
+        let port = ports.get(dev.index).context("output port index out of range")?;
+        let port_name = out
+            .port_name(port)
+            .unwrap_or_else(|_| format!("Output #{}", dev.index));
+
+        let conn = out
+            .connect(port, "midir-tui-out")
+            .with_context(|| format!("Failed to open output: {port_name}"))?;
+
+        self.out_conn = Some(conn);
+        self.open_device = Some(dev.key.clone());
+        self.push_status(format!("Opened output: {}", port_name));
+        Ok(())
+    }
+
+    fn close_open(&mut self) {
+        if self.in_conn.is_some() {
+            self.in_conn.take(); // drop closes
+            self.push_status("Closed input".into());
+        }
+        if self.out_conn.is_some() {
+            self.out_conn.take(); // drop closes
+            self.push_status("Closed output".into());
+        }
+        self.open_device = None;
+    }
+
+    fn push_status(&mut self, msg: String) {
+        if self.log.len() == self.log.capacity() {
+            self.log.pop_front();
+        }
+        self.log.push_back(format!("· {}", msg));
+    }
+
+    fn drain_rx(&mut self) {
+        while let Ok(s) = self.rx.try_recv() {
+            if self.log.len() == self.log.capacity() {
+                self.log.pop_front();
+            }
+            self.log.push_back(s);
+        }
+    }
+
+    fn save_persisted(&self) {
+        if let Some(path) = &self.persist_path {
+            let key = self.devices.get(self.selected).map(|d| d.key.clone());
+            let p = Persisted {
+                last_device: key,
+                last_focus: Some(self.focus),
+            };
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(path, serde_json::to_vec_pretty(&p).unwrap_or_default());
+        }
     }
 }
 
@@ -95,36 +266,57 @@ fn collect_devices() -> Result<Vec<DeviceItem>> {
 
     // Inputs
     for (idx, port) in inp.ports().iter().enumerate() {
-        let name = inp.port_name(port).unwrap_or_else(|_| format!("Input #{idx}"));
+        let name = inp
+            .port_name(port)
+            .unwrap_or_else(|_| format!("Input #{idx}"));
         items.push(DeviceItem {
-            name,
-            kind: MidiKind::Input,
+            key: DeviceKey {
+                name,
+                kind: MidiKind::Input,
+            },
             index: idx,
         });
     }
 
     // Outputs
     for (idx, port) in out.ports().iter().enumerate() {
-        let name = out.port_name(port).unwrap_or_else(|_| format!("Output #{idx}"));
+        let name = out
+            .port_name(port)
+            .unwrap_or_else(|_| format!("Output #{idx}"));
         items.push(DeviceItem {
-            name,
-            kind: MidiKind::Output,
+            key: DeviceKey {
+                name,
+                kind: MidiKind::Output,
+            },
             index: idx,
         });
     }
 
-    // Sort by kind then name for a stable, readable list
-    items.sort_by(|a, b| match ( &a.kind, &b.kind ) {
+    // Sort by kind then name
+    items.sort_by(|a, b| match (&a.key.kind, &b.key.kind) {
         (MidiKind::Input, MidiKind::Output) => std::cmp::Ordering::Less,
         (MidiKind::Output, MidiKind::Input) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        _ => a.key.name.to_lowercase().cmp(&b.key.name.to_lowercase()),
     });
 
     Ok(items)
 }
 
+fn persist_file_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "example", "midir-tui").map(|pd| {
+        let mut p = pd.config_dir().to_path_buf();
+        p.push("state.json");
+        p
+    })
+}
+
+fn load_persisted(path: &Option<PathBuf>) -> Option<Persisted> {
+    let p = path.as_ref()?;
+    let bytes = fs::read(p).ok()?;
+    serde_json::from_slice::<Persisted>(&bytes).ok()
+}
+
 fn main() -> Result<()> {
-    // Setup terminal
     enable_raw_mode().context("enable_raw_mode failed")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("EnterAlternateScreen failed")?;
@@ -145,50 +337,47 @@ fn main() -> Result<()> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new()?;
 
-    // Ticker/polling
     let tick = Duration::from_millis(100);
-
-    // Optional: auto-refresh device list every few seconds (hotplug-ish).
     let refresh_every = Duration::from_secs(5);
 
     let mut list_state = ListState::default();
     list_state.select(Some(app.selected));
 
-    loop {
-        // Auto refresh
+    let exit_result = loop {
+        // Drain incoming MIDI messages to log
+        app.drain_rx();
+
+        // Auto refresh (hotplug-ish)
         if app.last_refresh.elapsed() >= refresh_every {
             app.refresh_devices();
-            // Keep the list state aligned with app.selected
             list_state.select(Some(app.selected));
         }
 
         terminal.draw(|f| {
             let size = f.size();
-
-            // Outer layout: horizontal split
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
                 .split(size);
 
-            // LEFT: device list
+            // LEFT
             let items: Vec<ListItem> = app
                 .devices
                 .iter()
                 .map(|d| {
-                    let kind_tag = match d.kind {
+                    let kind_tag = match d.key.kind {
                         MidiKind::Input => "[IN] ",
                         MidiKind::Output => "[OUT]",
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::styled(kind_tag, Style::default().fg(Color::Yellow)),
-                        Span::raw(" "),
-                        Span::raw(&d.name),
-                    ]))
+                    let mut spans = vec![Span::styled(kind_tag, Style::default().fg(Color::Yellow)), Span::raw(" "), Span::raw(&d.key.name)];
+                    if Some(&d.key) == app.open_device.as_ref() {
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled("●OPEN", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                    }
+                    ListItem::new(Line::from(spans))
                 })
                 .collect();
 
-            // Focus/selection styles
             let (left_border_color, right_border_color) = match app.focus {
                 Focus::Left => (Color::Cyan, Color::DarkGray),
                 Focus::Right => (Color::DarkGray, Color::Cyan),
@@ -211,7 +400,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
             f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-            // RIGHT: details of selected device
+            // RIGHT
             let right_block = Block::default()
                 .title(" Details ")
                 .borders(Borders::ALL)
@@ -220,47 +409,94 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             let detail_area = right_block.inner(chunks[1]);
             f.render_widget(right_block, chunks[1]);
 
-            let detail_text = if let Some(dev) = app.devices.get(app.selected) {
-                let kind = match dev.kind {
+            let mut lines: Vec<Line> = vec![];
+
+            if let Some(dev) = app.devices.get(app.selected) {
+                let kind_str = match dev.key.kind {
                     MidiKind::Input => "Input",
                     MidiKind::Output => "Output",
                 };
-                // midir doesn’t expose manufacturer/product IDs; we show what we can.
-                vec![
-                    Line::from(Span::styled("Selected Device", Style::default().add_modifier(Modifier::BOLD))),
+                let open_str = if app.open_device.as_ref() == Some(&dev.key) {
+                    "OPEN"
+                } else {
+                    "CLOSED"
+                };
+
+                lines.extend([
+                    Line::from(Span::styled(
+                        "Selected Device",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
                     Line::from(""),
-                    Line::from(vec![Span::styled("Name: ", Style::default().fg(Color::Yellow)), Span::raw(&dev.name)]),
-                    Line::from(vec![Span::styled("Kind: ", Style::default().fg(Color::Yellow)), Span::raw(kind)]),
-                    Line::from(vec![Span::styled("Index: ", Style::default().fg(Color::Yellow)), Span::raw(dev.index.to_string())]),
+                    Line::from(vec![
+                        Span::styled("Name: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(&dev.key.name),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Kind: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(kind_str),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Index: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(dev.index.to_string()),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Status: ", Style::default().fg(Color::Yellow)),
+                        Span::styled(
+                            open_str,
+                            if open_str == "OPEN" {
+                                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::Red)
+                            },
+                        ),
+                    ]),
                     Line::from(""),
-                    Line::from("Notes:"),
-                    Line::from("• This info comes from midir’s port names."),
-                    Line::from("• Connect/open ports in your app logic if needed."),
-                ]
+                ]);
+
+                if dev.key.kind == MidiKind::Input {
+                    lines.push(Line::from(Span::styled(
+                        "Recent MIDI (latest first):",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+
+                    // Show newest first
+                    for s in app.log.iter().rev().take(15) {
+                        lines.push(Line::from(s.clone()));
+                    }
+                } else {
+                    lines.extend([
+                        Line::from("This is an OUTPUT device."),
+                        Line::from("Press Enter to open/close the port."),
+                    ]);
+                }
             } else {
-                vec![
+                lines.extend([
                     Line::from("No devices detected."),
                     Line::from("Press r to refresh."),
-                ]
-            };
+                ]);
+            }
 
-            let details = Paragraph::new(detail_text)
-                .wrap(Wrap { trim: true });
-
-            // Add a little inner margin
-            let detail_inner = detail_area.inner(&Margin { horizontal: 1, vertical: 1 });
+            let details = Paragraph::new(lines).wrap(Wrap { trim: true });
+            let detail_inner = detail_area.inner(&Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
             f.render_widget(details, detail_inner);
 
-            // FOOTER / help bar
+            // FOOTER
             let help = Paragraph::new(Line::from(vec![
                 Span::styled("Keys: ", Style::default().fg(Color::Yellow)),
                 Span::raw("↑/↓ select  "),
                 Span::raw("←/→ focus  "),
+                Span::raw("Enter open/close  "),
                 Span::raw("r refresh  "),
                 Span::raw("q/Esc quit"),
             ]))
             .block(Block::default().borders(Borders::TOP));
 
+            let size = f.size();
             let footer_rect = Rect {
                 x: size.x,
                 y: size.y + size.height.saturating_sub(1),
@@ -274,13 +510,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         if event::poll(tick)? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('r') => {
                         app.refresh_devices();
                         list_state.select(Some(app.selected));
                     }
                     KeyCode::Left => app.focus = Focus::Left,
                     KeyCode::Right => app.focus = Focus::Right,
+                    KeyCode::Enter => {
+                        if app.focus == Focus::Left {
+                            if let Err(e) = app.toggle_open_selected() {
+                                app.push_status(format!("Error: {e:#}"));
+                            }
+                        }
+                    }
                     KeyCode::Up => {
                         if app.focus == Focus::Left {
                             app.select_up();
@@ -293,12 +536,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             list_state.select(Some(app.selected));
                         }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
                     _ => {}
                 }
             }
         }
-    }
+    };
 
-    Ok(())
+    // Persist before exit
+    let _ = exit_result.as_ref();
+    // Save regardless of success
+    let mut app_for_persist = app;
+    app_for_persist.save_persisted();
+    exit_result
 }
