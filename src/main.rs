@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     io,
     path::PathBuf,
@@ -31,13 +31,13 @@ enum Focus {
     Right,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 enum MidiKind {
     Input,
     Output,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
 struct DeviceKey {
     name: String,
     kind: MidiKind,
@@ -64,10 +64,9 @@ struct App {
     // Persistence
     persist_path: Option<PathBuf>,
 
-    // Open connection (only one at a time for simplicity)
-    open_device: Option<DeviceKey>,
-    in_conn: Option<MidiInputConnection<()>>,
-    out_conn: Option<MidiOutputConnection>,
+    // Multiple open connections, keyed by device
+    in_conns: HashMap<DeviceKey, MidiInputConnection<()>>,
+    out_conns: HashMap<DeviceKey, MidiOutputConnection>,
 
     // Live log (for input devices)
     log: VecDeque<String>,
@@ -97,10 +96,9 @@ impl App {
             focus: persisted.last_focus.unwrap_or(Focus::Left),
             last_refresh: Instant::now(),
             persist_path,
-            open_device: None,
-            in_conn: None,
-            out_conn: None,
-            log: VecDeque::with_capacity(512),
+            in_conns: HashMap::new(),
+            out_conns: HashMap::new(),
+            log: VecDeque::with_capacity(1024),
             tx,
             rx,
         })
@@ -147,52 +145,58 @@ impl App {
         }
         let dev = self.devices[self.selected].clone();
 
-        // If same device is already open -> close it
-        if self.open_device.as_ref() == Some(&dev.key) {
-            self.close_open();
-            return Ok(());
-        }
-
-        // Otherwise switch: close current and open the selected
-        self.close_open();
         match dev.key.kind {
-            MidiKind::Input => self.open_input(&dev),
-            MidiKind::Output => self.open_output(&dev),
+            MidiKind::Input => {
+                if self.in_conns.remove(&dev.key).is_some() {
+                    self.push_status(format!("Closed input: {}", dev.key.name));
+                } else {
+                    self.open_input(&dev)?;
+                }
+            }
+            MidiKind::Output => {
+                if self.out_conns.remove(&dev.key).is_some() {
+                    self.push_status(format!("Closed output: {}", dev.key.name));
+                } else {
+                    self.open_output(&dev)?;
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn close_all(&mut self) {
+        let in_count = self.in_conns.len();
+        let out_count = self.out_conns.len();
+        self.in_conns.clear();  // drop closes
+        self.out_conns.clear(); // drop closes
+        self.push_status(format!("Closed all ports (inputs: {in_count}, outputs: {out_count})"));
     }
 
     fn open_input(&mut self, dev: &DeviceItem) -> Result<()> {
         let mut inp = MidiInput::new("midir-tui-input").context("create MidiInput failed")?;
-        // Receive everything (no ignore)
         inp.ignore(midir::Ignore::None);
 
-        // Re-enumerate and pick by index within inputs
         let ports = inp.ports();
         let port = ports.get(dev.index).context("input port index out of range")?;
         let port_name = inp
             .port_name(port)
             .unwrap_or_else(|_| format!("Input #{}", dev.index));
 
+        let name_for_log = dev.key.name.clone();
         let tx = self.tx.clone();
         let conn = inp
             .connect(
                 port,
                 "midir-tui-in",
                 move |_stamp, message, _| {
-                    // Small, cheap formatting
-                    let s = format!(
-                        "IN  {:02X?}  (len {})",
-                        message,
-                        message.len()
-                    );
+                    let s = format!("IN  {:02X?}  (len {})  [{}]", message, message.len(), name_for_log);
                     let _ = tx.send(s);
                 },
                 (),
             )
             .with_context(|| format!("Failed to open input: {port_name}"))?;
 
-        self.in_conn = Some(conn);
-        self.open_device = Some(dev.key.clone());
+        self.in_conns.insert(dev.key.clone(), conn);
         self.push_status(format!("Opened input: {}", port_name));
         Ok(())
     }
@@ -209,22 +213,9 @@ impl App {
             .connect(port, "midir-tui-out")
             .with_context(|| format!("Failed to open output: {port_name}"))?;
 
-        self.out_conn = Some(conn);
-        self.open_device = Some(dev.key.clone());
+        self.out_conns.insert(dev.key.clone(), conn);
         self.push_status(format!("Opened output: {}", port_name));
         Ok(())
-    }
-
-    fn close_open(&mut self) {
-        if self.in_conn.is_some() {
-            self.in_conn.take(); // drop closes
-            self.push_status("Closed input".into());
-        }
-        if self.out_conn.is_some() {
-            self.out_conn.take(); // drop closes
-            self.push_status("Closed output".into());
-        }
-        self.open_device = None;
     }
 
     fn push_status(&mut self, msg: String) {
@@ -360,7 +351,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 .constraints([Constraint::Percentage(45), Constraint::Percentage(55)].as_ref())
                 .split(size);
 
-            // LEFT
+            // LEFT: list with OPEN marks
             let items: Vec<ListItem> = app
                 .devices
                 .iter()
@@ -369,10 +360,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         MidiKind::Input => "[IN] ",
                         MidiKind::Output => "[OUT]",
                     };
-                    let mut spans = vec![Span::styled(kind_tag, Style::default().fg(Color::Yellow)), Span::raw(" "), Span::raw(&d.key.name)];
-                    if Some(&d.key) == app.open_device.as_ref() {
+                    let mut spans = vec![
+                        Span::styled(kind_tag, Style::default().fg(Color::Yellow)),
+                        Span::raw(" "),
+                        Span::raw(&d.key.name),
+                    ];
+                    let is_open = match d.key.kind {
+                        MidiKind::Input => app.in_conns.contains_key(&d.key),
+                        MidiKind::Output => app.out_conns.contains_key(&d.key),
+                    };
+                    if is_open {
                         spans.push(Span::raw(" "));
-                        spans.push(Span::styled("●OPEN", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(
+                            "●OPEN",
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
                     }
                     ListItem::new(Line::from(spans))
                 })
@@ -384,7 +386,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             };
 
             let left_block = Block::default()
-                .title(" MIDI Devices ")
+                .title(format!(
+                    " MIDI Devices  (open: in {}, out {}) ",
+                    app.in_conns.len(),
+                    app.out_conns.len()
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(left_border_color));
 
@@ -400,7 +406,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
             f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-            // RIGHT
+            // RIGHT: details + recent MIDI
             let right_block = Block::default()
                 .title(" Details ")
                 .borders(Borders::ALL)
@@ -416,11 +422,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                     MidiKind::Input => "Input",
                     MidiKind::Output => "Output",
                 };
-                let open_str = if app.open_device.as_ref() == Some(&dev.key) {
-                    "OPEN"
-                } else {
-                    "CLOSED"
+                let is_open = match dev.key.kind {
+                    MidiKind::Input => app.in_conns.contains_key(&dev.key),
+                    MidiKind::Output => app.out_conns.contains_key(&dev.key),
                 };
+                let open_str = if is_open { "OPEN" } else { "CLOSED" };
 
                 lines.extend([
                     Line::from(Span::styled(
@@ -444,7 +450,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         Span::styled("Status: ", Style::default().fg(Color::Yellow)),
                         Span::styled(
                             open_str,
-                            if open_str == "OPEN" {
+                            if is_open {
                                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::Red)
@@ -460,15 +466,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         Style::default().add_modifier(Modifier::BOLD),
                     )));
                     lines.push(Line::from(""));
-
-                    // Show newest first
                     for s in app.log.iter().rev().take(15) {
                         lines.push(Line::from(s.clone()));
                     }
                 } else {
                     lines.extend([
                         Line::from("This is an OUTPUT device."),
-                        Line::from("Press Enter to open/close the port."),
+                        Line::from("Press Enter to open/close this port."),
+                        Line::from("Shift+C closes all open ports."),
                     ]);
                 }
             } else {
@@ -491,6 +496,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 Span::raw("↑/↓ select  "),
                 Span::raw("←/→ focus  "),
                 Span::raw("Enter open/close  "),
+                Span::raw("Shift+C close-all  "),
                 Span::raw("r refresh  "),
                 Span::raw("q/Esc quit"),
             ]))
@@ -524,6 +530,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             }
                         }
                     }
+                    KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.close_all();
+                    }
                     KeyCode::Up => {
                         if app.focus == Focus::Left {
                             app.select_up();
@@ -545,7 +554,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
     // Persist before exit
     let _ = exit_result.as_ref();
-    // Save regardless of success
     let mut app_for_persist = app;
     app_for_persist.save_persisted();
     exit_result
