@@ -89,7 +89,7 @@ jobs:
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             ARCHIVE="${PKG}.zip"
-            (cd "$PKG" && zip -9r "../${OUTDIR}/${ARCHIVE}" .)
+            (cd "$PKG" && "C:\Program Files\7-Zip\7z.exe" a -tzip  "../${OUTDIR}/${ARCHIVE}" .)
           else
             ARCHIVE="${PKG}.tar.gz"
             tar -C "$PKG" -czf "${OUTDIR}/${ARCHIVE}" .
