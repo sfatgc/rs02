@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, VecDeque},
-    fs,
-    io,
+    fs, io,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
+use anyhow::anyhow;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -167,9 +167,11 @@ impl App {
     fn close_all(&mut self) {
         let in_count = self.in_conns.len();
         let out_count = self.out_conns.len();
-        self.in_conns.clear();  // drop closes
+        self.in_conns.clear(); // drop closes
         self.out_conns.clear(); // drop closes
-        self.push_status(format!("Closed all ports (inputs: {in_count}, outputs: {out_count})"));
+        self.push_status(format!(
+            "Closed all ports (inputs: {in_count}, outputs: {out_count})"
+        ));
     }
 
     fn open_input(&mut self, dev: &DeviceItem) -> Result<()> {
@@ -177,7 +179,9 @@ impl App {
         inp.ignore(midir::Ignore::None);
 
         let ports = inp.ports();
-        let port = ports.get(dev.index).context("input port index out of range")?;
+        let port = ports
+            .get(dev.index)
+            .context("input port index out of range")?;
         let port_name = inp
             .port_name(port)
             .unwrap_or_else(|_| format!("Input #{}", dev.index));
@@ -189,12 +193,17 @@ impl App {
                 port,
                 "midir-tui-in",
                 move |_stamp, message, _| {
-                    let s = format!("IN  {:02X?}  (len {})  [{}]", message, message.len(), name_for_log);
+                    let s = format!(
+                        "IN  {:02X?}  (len {})  [{}]",
+                        message,
+                        message.len(),
+                        name_for_log
+                    );
                     let _ = tx.send(s);
                 },
                 (),
             )
-            .with_context(|| format!("Failed to open input: {port_name}"))?;
+            .map_err(|e| anyhow!("Failed to open input: {port_name}: {e}"))?;
 
         self.in_conns.insert(dev.key.clone(), conn);
         self.push_status(format!("Opened input: {}", port_name));
@@ -204,14 +213,16 @@ impl App {
     fn open_output(&mut self, dev: &DeviceItem) -> Result<()> {
         let out = MidiOutput::new("midir-tui-output").context("create MidiOutput failed")?;
         let ports = out.ports();
-        let port = ports.get(dev.index).context("output port index out of range")?;
+        let port = ports
+            .get(dev.index)
+            .context("output port index out of range")?;
         let port_name = out
             .port_name(port)
             .unwrap_or_else(|_| format!("Output #{}", dev.index));
 
         let conn = out
             .connect(port, "midir-tui-out")
-            .with_context(|| format!("Failed to open output: {port_name}"))?;
+            .map_err(|e| anyhow!("Failed to open output: {port_name}: {e}"))?;
 
         self.out_conns.insert(dev.key.clone(), conn);
         self.push_status(format!("Opened output: {}", port_name));
@@ -373,7 +384,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(
                             "●OPEN",
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     }
                     ListItem::new(Line::from(spans))
@@ -451,7 +464,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                         Span::styled(
                             open_str,
                             if is_open {
-                                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::Red)
                             },
@@ -545,7 +560,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                             list_state.select(Some(app.selected));
                         }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break Ok(())
+                    }
                     _ => {}
                 }
             }
@@ -554,7 +571,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
     // Persist before exit
     let _ = exit_result.as_ref();
-    let mut app_for_persist = app;
+    let app_for_persist = app;
     app_for_persist.save_persisted();
     exit_result
 }
