@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust ${{ matrix.target }}
         uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up QEMU aarch64
         uses: docker/setup-qemu-action@v3
