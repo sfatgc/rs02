@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-crossterm = "0.27"
+crossterm = "0.29"
 ratatui = "0.26"
 midir = "0.9"
 anyhow = "1.0"
