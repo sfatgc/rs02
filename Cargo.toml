@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 crossterm = "0.27"
 ratatui = "0.26"
-midir = "0.9"
+midir = "0.10"
 anyhow = "1.0"
 directories = "5"
 serde = { version = "1", features = ["derive"] }
